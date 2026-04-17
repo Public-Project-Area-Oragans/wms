@@ -1,0 +1,173 @@
+name: CI
+
+# 모든 브랜치로의 PR + main push 시 실행
+# 모노레포 구조: backend/ (Spring Boot, Gradle), front/ (React/Node), mobile/ (Flutter)
+# paths-filter 로 변경된 폴더의 잡만 실행하여 불필요한 빌드를 건너뜁니다.
+
+on:
+  pull_request:
+    branches:
+      - '**'
+  push:
+    branches:
+      - main
+
+# 같은 브랜치에서 새 커밋이 오면 이전 러너를 취소
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # 1) 변경된 경로 감지
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      front:   ${{ steps.filter.outputs.front }}
+      mobile:  ${{ steps.filter.outputs.mobile }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Filter paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+              - '.github/workflows/**'
+            front:
+              - 'front/**'
+              - '.github/workflows/**'
+            mobile:
+              - 'mobile/**'
+              - '.github/workflows/**'
+
+  # 2) Spring Boot 백엔드 (Gradle + Java 21)
+  backend:
+    name: Backend (Gradle build & test)
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Build & Test
+        run: ./gradlew --no-daemon clean build
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-reports
+          path: backend/build/reports/tests/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # 3) React 프런트엔드 (Node 20 + npm)
+  front:
+    name: Front (npm lint/test/build)
+    needs: changes
+    if: needs.changes.outputs.front == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: front
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: front/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (skip if not defined)
+        run: npm run lint --if-present
+
+      - name: Test (skip if not defined)
+        run: npm test --if-present -- --run
+        env:
+          CI: true
+
+      - name: Build
+        run: npm run build
+
+  # 4) Flutter 모바일
+  mobile:
+    name: Mobile (Flutter analyze & test)
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter --version
+        run: flutter --version
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      - name: flutter analyze
+        run: flutter analyze
+
+      - name: flutter test
+        run: flutter test
+
+  # 5) 모든 잡 통과 여부를 종합 (branch protection용 status check)
+  ci-success:
+    name: CI Success
+    needs: [backend, front, mobile]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate results
+        run: |
+          echo "Backend: ${{ needs.backend.result }}"
+          echo "Front:   ${{ needs.front.result }}"
+          echo "Mobile:  ${{ needs.mobile.result }}"
+
+          fail=0
+          for r in "${{ needs.backend.result }}" "${{ needs.front.result }}" "${{ needs.mobile.result }}"; do
+            case "$r" in
+              success|skipped|'') ;;
+              *) fail=1 ;;
+            esac
+          done
+          if [ "$fail" -eq 1 ]; then
+            echo "::error::One or more jobs failed."
+            exit 1
+          fi
+          echo "All jobs passed (or skipped)."
