@@ -83,9 +83,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # 3) React 프런트엔드 (Node 20 + npm)
+  # 3) React 프런트엔드 (Node 20 + npm, TypeScript/JSX/TSX 지원)
   front:
-    name: Front (npm lint/test/build)
+    name: Front (React lint/typecheck/test/build)
     needs: changes
     if: needs.changes.outputs.front == 'true'
     runs-on: ubuntu-latest
@@ -102,19 +102,107 @@ jobs:
           cache: 'npm'
           cache-dependency-path: front/package-lock.json
 
+      - name: Print tooling versions
+        run: |
+          node --version
+          npm --version
+
       - name: Install dependencies
         run: npm ci
 
-      - name: Lint (skip if not defined)
-        run: npm run lint --if-present
+      # ----- 품질 게이트 -----
+      # ESLint: package.json 의 "lint" 스크립트가 있으면 그것을 실행,
+      # 없으면 .js/.jsx/.ts/.tsx 에 대해 기본 eslint 를 시도합니다.
+      - name: Lint (JS/JSX/TS/TSX)
+        run: |
+          if node -e "p=require('./package.json');process.exit(p.scripts && p.scripts.lint ? 0 : 1)"; then
+            echo "Running: npm run lint"
+            npm run lint
+          elif [ -f node_modules/.bin/eslint ]; then
+            echo "Running: eslint . --ext .js,.jsx,.ts,.tsx --max-warnings=0"
+            npx --no-install eslint . --ext .js,.jsx,.ts,.tsx --max-warnings=0
+          else
+            echo "No lint script or eslint binary found; skipping."
+          fi
 
-      - name: Test (skip if not defined)
+      # Prettier: "format:check" 스크립트 또는 prettier 바이너리가 있으면 실행
+      - name: Format check (Prettier, optional)
+        run: |
+          if node -e "p=require('./package.json');process.exit(p.scripts && p.scripts['format:check'] ? 0 : 1)"; then
+            npm run format:check
+          elif [ -f node_modules/.bin/prettier ]; then
+            npx --no-install prettier --check "**/*.{js,jsx,ts,tsx,css,scss,json,md}" || true
+          else
+            echo "Prettier not configured; skipping."
+          fi
+
+      # TypeScript type check: tsconfig.json 이 있으면 tsc --noEmit 실행 (tsx 타입 검증 포함)
+      - name: TypeScript type check (tsx/ts)
+        run: |
+          if [ -f tsconfig.json ]; then
+            if node -e "p=require('./package.json');process.exit(p.scripts && p.scripts.typecheck ? 0 : 1)"; then
+              echo "Running: npm run typecheck"
+              npm run typecheck
+            else
+              echo "Running: tsc --noEmit"
+              npx --no-install tsc --noEmit
+            fi
+          else
+            echo "No tsconfig.json; skipping type check."
+          fi
+
+      # ----- 테스트 -----
+      # Vitest / Jest / React Testing Library 모두 `npm test` 로 동작하도록 합니다.
+      # Vitest 는 watch 가 기본이므로 -- --run 을 전달 (jest 에서는 무시됨)
+      - name: Unit tests (Vitest / Jest / RTL)
         run: npm test --if-present -- --run
         env:
           CI: true
 
-      - name: Build
+      # 커버리지 스크립트가 있으면 추가 실행 + 리포트 업로드
+      - name: Coverage (optional)
+        id: coverage
+        run: |
+          if node -e "p=require('./package.json');process.exit(p.scripts && (p.scripts['test:coverage'] || p.scripts.coverage) ? 0 : 1)"; then
+            if node -e "p=require('./package.json');process.exit(p.scripts['test:coverage'] ? 0 : 1)"; then
+              npm run test:coverage
+            else
+              npm run coverage
+            fi
+            echo "has_coverage=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No coverage script; skipping."
+            echo "has_coverage=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload coverage report
+        if: steps.coverage.outputs.has_coverage == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: front-coverage
+          path: |
+            front/coverage/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ----- 빌드 -----
+      - name: Build (Vite / CRA / Next.js)
         run: npm run build
+        env:
+          CI: true
+
+      - name: Upload build output
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: front-build
+          # Vite → dist/, CRA → build/, Next.js → .next/
+          path: |
+            front/dist/
+            front/build/
+            front/.next/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # 4) Flutter 모바일
   mobile:
